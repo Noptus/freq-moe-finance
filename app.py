@@ -35,6 +35,7 @@ st.set_page_config(
 
 st.title("🔮 FreqMoE Time‑Series Forecaster")
 st.sidebar.markdown("**Author :** Tina Truong")
+st.sidebar.markdown("**Date :** June 2025")
 
 st.markdown(
     """Automatically decomposes the input time series into **frequency bands**, trains
