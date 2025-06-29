@@ -1,31 +1,32 @@
-# FreqMoE Streamlit Demo
-# Author: Tina Truong
+# FreqMoE Streamlit Demo (Polygon.io Edition)
+# Author: Tina Truong
 # --------------------------------------------------
-# A lightweight, deploy‑friendly implementation of the Frequency‑Decomposition Mixture‑of‑Experts
-# (FreqMoE) model for time‑series forecasting.  Users can choose between uploading a CSV file or
-# fetching financial price data from Finnhub.  The model splits the input series into N frequency
-# bands, trains one expert per band, weights their forecasts with a soft‑max gate, and returns a
-# 30‑step forecast together with intuitive visualisations of each expert’s contribution.
-#
+# Automatically forecasts the next 30 steps of a univariate series using
+# Frequency‑Decomposition Mixture‑of‑Experts (FreqMoE).  Users can upload
+# a CSV **or** fetch daily OHLC from Polygon.io.
 # --------------------------------------------------
-# 3rd‑party dependencies (see requirements.txt):
-#   streamlit, numpy, pandas, scipy, scikit‑learn, matplotlib, requests (for Finnhub)
+# Highlights
+#   • Energy‑balanced frequency bands for more even expert focus
+#   • Linear or MLP experts trained on‑the‑fly (no button needed)
+#   • Soft‑max gate combines expert forecasts
+#   • Detailed table shows each expert's band, bandwidth, energy share,
+#     learned weight and model configuration
+# --------------------------------------------------
+#  Requirements (see requirements.txt):
+#   streamlit, numpy, pandas, scipy, scikit-learn, matplotlib, requests
 # --------------------------------------------------
 
-import io
-import os
-import time
-import json
-import math
-import textwrap
+from __future__ import annotations
+
 import datetime as dt
 from typing import List, Tuple
 
-import requests
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
 from matplotlib.ticker import MaxNLocator
 from scipy.fft import rfft, irfft
 from sklearn.linear_model import LinearRegression
@@ -34,257 +35,211 @@ from sklearn.preprocessing import StandardScaler
 
 # -------------------- Streamlit page config --------------------
 st.set_page_config(
-    page_title="FreqMoE Forecaster",
+    page_title="FreqMoE Forecaster – Polygon.io",
     page_icon="🔮",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🔮 FreqMoE Time‑Series Forecaster")
+st.title("🔮 FreqMoE Time‑Series Forecaster")
+st.sidebar.markdown("**Author :** Tina Truong")
+
 st.markdown(
-    """Interactively forecast the next **30 steps** of a univariate time series using
-    **Frequency‑Decomposition Mixture‑of‑Experts (FreqMoE)**.  Each expert focuses on a
-    different frequency band, and a soft‑max gate combines their predictions.
+    """
+    **FreqMoE** splits the input series into frequency bands, trains one expert per
+    band, then gates their forecasts by the input's frequency energy.  All steps run
+    automatically as soon as data & parameters are available—no extra clicks.
     """
 )
 
-st.sidebar.markdown("**Author :** Tina Truong")
+# -------------------- Constants --------------------
+DEFAULT_POLYGON_KEY = "p46qnFerUpAecBAsNFBHzUhuhKGrYGM5"
+API_ENDPOINT = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
+HORIZON = 30  # forecast length
 
-# -------------------- Utility functions --------------------
+# -------------------- Helper functions --------------------
 
-DEFAULT_FINNHUB_KEY = "sandbox_finnhub_demo_key"  # Replace with your demo key if desired
-FINNHUB_CANDLE_ENDPOINT = "https://finnhub.io/api/v1/stock/candle"
-
-HORIZON = 30  # forecast horizon in steps (configurable here)
-
-
-def fetch_finnhub_series(symbol: str, start: dt.date, end: dt.date, token: str) -> pd.Series:
-    """Fetches daily close prices from Finnhub and returns them as a pandas Series indexed by date."""
-
+def fetch_polygon_series(ticker: str, start: dt.date, end: dt.date, api_key: str) -> pd.Series:
+    """Fetch daily closes from Polygon.io."""
+    url = API_ENDPOINT.format(ticker=ticker.upper(), start=start, end=end)
     params = {
-        "symbol": symbol.upper(),
-        "resolution": "D",
-        "from": int(time.mktime(start.timetuple())),
-        "to": int(time.mktime(end.timetuple())),
-        "token": token,
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 50000,
+        "apiKey": api_key,
     }
-    r = requests.get(FINNHUB_CANDLE_ENDPOINT, params=params, timeout=10)
-    r.raise_for_status()
-    payload = r.json()
-
-    if payload.get("s") != "ok":
-        raise ValueError("Finnhub replied with an error or no data (status=%s)." % payload.get("s"))
-
-    closes = payload["c"]
-    timestamps = payload["t"]  # unix epoch seconds
-    dates = pd.to_datetime(timestamps, unit="s")
-    series = pd.Series(closes, index=dates, name="close").astype(float)
-    return series
+    res = requests.get(url, params=params, timeout=10)
+    res.raise_for_status()
+    data = res.json()
+    if not data.get("results"):
+        raise ValueError("Polygon returned no data for this period.")
+    closes = [item["c"] for item in data["results"]]
+    ts = [item["t"] for item in data["results"]]  # unix ms
+    idx = pd.to_datetime(ts, unit="ms")
+    return pd.Series(closes, index=idx, name="close").astype(float)
 
 
-def prepare_sliding_windows(values: np.ndarray, lookback: int, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Creates (X, y) pairs for supervised learning from a 1‑D array."""
-    n_total = len(values)
-    n_samples = n_total - lookback - horizon + 1
-    if n_samples <= 0:
-        raise ValueError("Time series too short for the chosen look‑back and horizon.")
-    X = np.zeros((n_samples, lookback))
-    y = np.zeros((n_samples, horizon))
-    for i in range(n_samples):
-        X[i] = values[i : i + lookback]
-        y[i] = values[i + lookback : i + lookback + horizon]
+def sliding_windows(values: np.ndarray, lookback: int, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(values) - lookback - horizon + 1
+    if n <= 0:
+        raise ValueError("Series too short for chosen look‑back/horizon.")
+    X = np.lib.stride_tricks.sliding_window_view(values, lookback)[:n]
+    y = np.array([values[i + lookback : i + lookback + horizon] for i in range(n)])
     return X, y
 
 
-# -------- Frequency decomposition / expert helpers --------
+# ---------- Energy‑balanced band splitter ----------
 
-def split_frequency_bands(n_freq: int, n_experts: int) -> List[slice]:
-    """Returns list of slice objects partitioning the positive‑frequency indices into n_experts bands."""
-    # Equal‑width partitioning in the frequency domain.
-    band_width = n_freq // n_experts
-    slices = []
-    for i in range(n_experts):
-        start = i * band_width
-        end = (i + 1) * band_width if i < n_experts - 1 else n_freq  # last band takes remainder
-        slices.append(slice(start, end))
-    return slices
+def energy_balanced_bands(energy: np.ndarray, n_experts: int) -> List[slice]:
+    """Return slices where each band has ~equal cumulative energy."""
+    total = energy.sum()
+    target = total / n_experts
+    cuts = [0]
+    acc = 0.0
+    for i, e in enumerate(energy):
+        acc += e
+        if acc >= target and len(cuts) < n_experts:
+            cuts.append(i + 1)
+            acc = 0.0
+    cuts.append(len(energy))
+    # ensure monotonic increasing indices & length = n_experts + 1
+    while len(cuts) < n_experts + 1:
+        cuts.insert(-1, cuts[-2])
+    bands = [slice(cuts[i], cuts[i + 1]) for i in range(n_experts)]
+    return bands
 
 
-def decompose_series(series: np.ndarray, n_experts: int) -> Tuple[List[np.ndarray], np.ndarray]:
-    """Decomposes signal into n_experts band‑limited components and returns (components, band_energies)."""
-    fft_coeffs = rfft(series)  # real FFT (length n_freq)
-    mag = np.abs(fft_coeffs)
-    n_freq = len(fft_coeffs)
-    bands = split_frequency_bands(n_freq, n_experts)
-
-    components = []
-    energies = np.zeros(n_experts)
-    for idx, sl in enumerate(bands):
-        mask = np.zeros_like(fft_coeffs, dtype=bool)
+def decompose(series: np.ndarray, n_experts: int):
+    coeffs = rfft(series)
+    mag = np.abs(coeffs)
+    # Build energy array for each single frequency bin (ignoring symmetry as rfft output already half)
+    bands = energy_balanced_bands(mag, n_experts)
+    components, band_energy = [], []
+    for sl in bands:
+        mask = np.zeros_like(coeffs, dtype=bool)
         mask[sl] = True
-        masked_coeffs = np.where(mask, fft_coeffs, 0)
-        component = irfft(masked_coeffs, n=len(series))  # back to time domain
-        components.append(component)
-        energies[idx] = mag[sl].sum()
-    return components, energies
+        comp_coeffs = np.where(mask, coeffs, 0)
+        components.append(irfft(comp_coeffs, n=len(series)))
+        band_energy.append(mag[sl].sum())
+    return components, np.array(band_energy), bands
 
 
-# -------------- Expert model wrapper --------------
+# ---------- Expert Wrapper ----------
 
-class ExpertModel:
-    """Wraps a regression model (linear or MLP) for convenience."""
-
-    def __init__(self, model_type: str, lookback: int, horizon: int, random_state: int = 42):
+class Expert:
+    def __init__(self, model_type: str, lookback: int, horizon: int, seed: int):
+        self.lookback, self.horizon = lookback, horizon
+        self.scaler_x, self.scaler_y = StandardScaler(), StandardScaler()
         self.model_type = model_type
-        self.lookback = lookback
-        self.horizon = horizon
-        self.random_state = random_state
-        self.scaler_x = StandardScaler()
-        self.scaler_y = StandardScaler()
-        self._build_model()
-
-    def _build_model(self):
-        if self.model_type == "Linear Regression":
-            self.model = LinearRegression(n_jobs=1)
-        else:  # MLP
-            self.model = MLPRegressor(
-                hidden_layer_sizes=(64,),
-                activation="relu",
-                solver="adam",
-                max_iter=500,
-                random_state=self.random_state,
-                verbose=False,
-            )
+        if model_type == "Linear Regression":
+            self.model = LinearRegression()
+        else:
+            self.model = MLPRegressor(hidden_layer_sizes=(64,), max_iter=500, random_state=seed)
 
     def fit(self, series: np.ndarray):
-        X, y = prepare_sliding_windows(series, self.lookback, self.horizon)
-        # Standardise features & targets for MLP stability; harmless for linear.
-        X_scaled = self.scaler_x.fit_transform(X)
-        y_scaled = self.scaler_y.fit_transform(y)
-        self.model.fit(X_scaled, y_scaled)
+        X, y = sliding_windows(series, self.lookback, self.horizon)
+        Xs = self.scaler_x.fit_transform(X)
+        ys = self.scaler_y.fit_transform(y)
+        self.model.fit(Xs, ys)
 
-    def predict(self, recent_window: np.ndarray) -> np.ndarray:
-        assert len(recent_window) == self.lookback
-        X = recent_window.reshape(1, -1)
-        X_scaled = self.scaler_x.transform(X)
-        y_scaled_pred = self.model.predict(X_scaled)
-        y_pred = self.scaler_y.inverse_transform(y_scaled_pred).flatten()
-        return y_pred  # length horizon
+    def predict(self, recent: np.ndarray) -> np.ndarray:
+        xs = self.scaler_x.transform(recent.reshape(1, -1))
+        ys = self.model.predict(xs)
+        return self.scaler_y.inverse_transform(ys).flatten()
 
 
-# -------------- Sidebar: data source selection --------------
+# -------------------- Sidebar: inputs --------------------
+st.sidebar.header("Data Source 📈")
+mode = st.sidebar.radio("Select source", ("CSV Upload", "Polygon API"))
 
-st.sidebar.header("1  Choose Data Source 📈")
-data_source = st.sidebar.radio("Select source", ("CSV Upload", "Finnhub API"))
-
-if data_source == "CSV Upload":
-    uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if not numeric_cols:
-            st.error("CSV must contain at least one numeric column.")
-            st.stop()
-        col_choice = st.sidebar.selectbox("Column to forecast", numeric_cols)
-        series = pd.Series(df[col_choice].values, index=np.arange(len(df[col_choice])))
-    else:
-        st.info("Please upload a CSV file.")
+if mode == "CSV Upload":
+    file = st.sidebar.file_uploader("Upload CSV", ["csv"])
+    if file is None:
+        st.info("Upload a CSV to begin.")
         st.stop()
+    df = pd.read_csv(file)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not numeric_cols:
+        st.error("No numeric column found in CSV.")
+        st.stop()
+    col = st.sidebar.selectbox("Column", numeric_cols)
+    series = pd.Series(df[col].values, index=np.arange(len(df[col])))
 else:
-    st.sidebar.write("Fetch daily OHLC prices from Finnhub (free tier).")
-    default_symbol = "AAPL"
-    symbol = st.sidebar.text_input("Ticker symbol", value=default_symbol)
-    end_date = dt.date.today()
-    start_date = end_date - dt.timedelta(days=365 * 2)  # 2 years
-    token_input = st.sidebar.text_input(
-        "Finnhub API key (leave blank for demo key)",
-        value="",
-        type="password",
-    )
-    api_key = token_input.strip() or DEFAULT_FINNHUB_KEY
+    ticker = st.sidebar.text_input("Ticker", "AAPL")
+    key = st.sidebar.text_input("Polygon API key", DEFAULT_POLYGON_KEY, type="password")
+    end_d = dt.date.today()
+    start_d = end_d - dt.timedelta(days=365 * 2)
     try:
-        series = fetch_finnhub_series(symbol, start_date, end_date, api_key)
-    except Exception as e:
-        st.error(f"Finnhub error: {e}")
+        series = fetch_polygon_series(ticker, start_d.strftime("%Y-%m-%d"), end_d.strftime("%Y-%m-%d"), key)
+    except Exception as exc:
+        st.error(f"Polygon error: {exc}")
         st.stop()
 
-# Show raw data preview
-st.subheader("Input Time Series")
-st.line_chart(series)
+# Model params
+st.sidebar.header("Model Parameters ⚙️")
+N = st.sidebar.slider("Number of experts", 1, 10, 3)
+model_choice = st.sidebar.selectbox("Expert model", ["Linear Regression", "Neural Network (MLP)"])
+lookback = st.sidebar.slider("Look‑back window", 20, 200, 100, step=5)
 
-# -------------- Sidebar: model parameters --------------
+# -------------------- Run pipeline automatically --------------------
+values = series.values.astype(float)
+if len(values) < lookback + HORIZON:
+    st.error("Series too short for chosen parameters.")
+    st.stop()
 
-st.sidebar.header("2  Model Parameters ⚙️")
-num_experts = st.sidebar.slider("Number of experts", min_value=1, max_value=10, value=3, step=1)
-model_type = st.sidebar.selectbox("Expert model type", ["Linear Regression", "Neural Network (MLP)"])
-lookback = st.sidebar.slider("Look‑back window (history points)", min_value=20, max_value=200, value=100, step=5)
+components, band_energy, band_slices = decompose(values, N)
+weights = np.exp(band_energy) / np.exp(band_energy).sum()
 
-run = st.sidebar.button("🚀 Run Forecast")
+recent = values[-lookback:]
+expert_preds = []
+experts = []
+for i, comp in enumerate(components):
+    exp = Expert(model_choice, lookback, HORIZON, seed=i)
+    exp.fit(comp)
+    experts.append(exp)
+    expert_preds.append(exp.predict(comp[-lookback:]))
 
-if run:
-    st.subheader("Results")
-    data = series.values.astype(float)
-    if len(data) < lookback + HORIZON:
-        st.error("Time series too short for the given look‑back and forecast horizon.")
-        st.stop()
+a_preds = np.array(expert_preds)
+forecast = (weights[:, None] * a_preds).sum(axis=0)
 
-    # -------- Decompose into frequency bands --------
-    components, band_energy = decompose_series(data, num_experts)
-    weights = np.exp(band_energy) / np.exp(band_energy).sum()  # soft‑max
+# -------------------- Visuals --------------------
+# Future index
+if isinstance(series.index, pd.DatetimeIndex):
+    freq = pd.infer_freq(series.index) or "D"
+    fut_idx = pd.date_range(series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=HORIZON, freq=freq)
+else:
+    fut_idx = np.arange(len(series), len(series) + HORIZON)
 
-    # -------- Train experts & forecast --------
-    expert_forecasts = []
-    recent_idx_start = len(data) - lookback
-    for idx, comp in enumerate(components):
-        expert = ExpertModel(model_type=model_type, lookback=lookback, horizon=HORIZON, random_state=idx)
-        expert.fit(comp)
-        forecast = expert.predict(comp[recent_idx_start:])
-        expert_forecasts.append(forecast)
+st.subheader("Forecast & Experts")
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(series.index, series.values, label="Historical", color="black")
+ax.plot(fut_idx, forecast, label="Forecast", color="red")
+ax.axvline(series.index[-1], ls="--", color="gray", alpha=0.5)
+for i in range(N):
+    ax.plot(fut_idx, a_preds[i], ls="--", alpha=0.7, label=f"Expert {i+1} ({weights[i]*100:.1f}%)")
+ax.set_title("FreqMoE 30‑step Forecast")
+ax.legend(loc="upper left")
+ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+st.pyplot(fig)
 
-    expert_forecasts = np.array(expert_forecasts)  # shape (n_experts, HORIZON)
-    final_forecast = (weights[:, None] * expert_forecasts).sum(axis=0)
+# Expert details table
+start_end = [(sl.start, sl.stop) for sl in band_slices]
+bandwidths = [sl.stop - sl.start for sl in band_slices]
 
-    # -------- Visualisation --------
-    # Prepare future index (numeric or datetime depending on input)
-    if isinstance(series.index, pd.DatetimeIndex):
-        freq = pd.infer_freq(series.index) or "D"
-        fut_index = pd.date_range(series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=HORIZON, freq=freq)
-    else:
-        fut_index = np.arange(len(series), len(series) + HORIZON)
+details = pd.DataFrame(
+    {
+        "Expert": np.arange(1, N + 1),
+        "Freq idx start": [s for s, _ in start_end],
+        "Freq idx end": [e for _, e in start_end],
+        "Bandwidth (bins)": bandwidths,
+        "Band energy": band_energy.round(2),
+        "Gate weight %": (weights * 100).round(2),
+        "Model": model_choice,
+        "Look‑back": lookback,
+    }
+).set_index("Expert")
 
-    # Main plot
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(series.index, series.values, label="Historical", color="black")
-    ax.plot(fut_index, final_forecast, label="Forecast", color="red")
-    ax.axvline(series.index[-1], linestyle="--", color="gray", alpha=0.5)
+st.subheader("Expert Details")
+st.dataframe(details)
 
-    # Plot expert components (optional)
-    for i in range(num_experts):
-        ax.plot(
-            fut_index,
-            expert_forecasts[i],
-            label=f"Expert {i+1} ({weights[i]*100:.1f}% weight)",
-            linestyle="--",
-            alpha=0.7,
-        )
-
-    ax.set_title("FreqMoE Forecast (30 steps ahead)")
-    ax.legend(loc="upper left")
-    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-    st.pyplot(fig)
-
-    # Gating weights bar
-    fig2, ax2 = plt.subplots(figsize=(4, 3))
-    ax2.bar(range(1, num_experts + 1), weights * 100)
-    ax2.set_xlabel("Expert #")
-    ax2.set_ylabel("Weight (%)")
-    ax2.set_title("Gating Weights")
-    ax2.set_xticks(range(1, num_experts + 1))
-    st.pyplot(fig2)
-
-    # Expert energy information
-    energy_df = pd.DataFrame({"Expert": np.arange(1, num_experts + 1), "Band Energy": band_energy, "Weight": weights})
-    st.write("### Expert Band Energies & Weights")
-    st.dataframe(energy_df.round(4))
-
-    st.success("Forecast complete ✔️")
+st.success("Automatic forecast complete ✔️")

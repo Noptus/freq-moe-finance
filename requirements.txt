@@ -1,0 +1,8 @@
+streamlit
+numpy
+pandas
+scipy      # for FFT (though numpy can do FFT as well)
+scikit-learn
+finnhub-python  # if using the official client
+matplotlib
+plotly
