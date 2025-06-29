@@ -37,6 +37,7 @@ st.sidebar.markdown("[Original FreqMoE paper, by Ziqi Liu](https://arxiv.org/abs
 st.sidebar.markdown("[Connect with me on LinkedIn](https://www.linkedin.com/in/tina-truong-nguyen/)")
 
 DEFAULT_POLY_KEY = "p46qnFerUpAecBAsNFBHzUhuhKGrYGM5"
+DEFAULT_POLY_KEY = ""
 POLY_EP = "https://api.polygon.io/v2/aggs/ticker/{tic}/range/1/day/{start}/{end}"
 HORIZON = 30
 TEMP, EPS = 1.0, 1e-3
@@ -367,6 +368,9 @@ elif mode == "Weather (Open-Meteo)":
 else:
     tic = st.sidebar.text_input("Ticker", "AAPL")
     key = st.sidebar.text_input("Polygon API key", DEFAULT_POLY_KEY, type="password")
+    if not key.strip():
+        st.error("Please enter a Polygon.io API key. You can get a free key at https://polygon.io .")
+        st.stop()
     ed = dt.date.today(); sd = ed - dt.timedelta(days=365*10)
     try:
         series = fetch_poly(tic, sd.strftime("%Y-%m-%d"), ed.strftime("%Y-%m-%d"), key)
