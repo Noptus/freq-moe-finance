@@ -29,6 +29,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 from joblib import Parallel, delayed
 import multiprocessing as mp
+from prophet import Prophet
 
 # ---------- Config ----------
 st.set_page_config(page_title="FreqMoE Forecaster", page_icon="🔮", layout="wide")
@@ -41,7 +42,7 @@ st.sidebar.markdown("[Connect with me on LinkedIn](https://www.linkedin.com/in
 DEFAULT_POLY_KEY = "p46qnFerUpAecBAsNFBHzUhuhKGrYGM5"
 DEFAULT_POLY_KEY = ""
 POLY_EP = "https://api.polygon.io/v2/aggs/ticker/{tic}/range/1/day/{start}/{end}"
-HORIZON = 30
+HORIZON = 24*10
 TEMP, EPS = 1.0, 1e-3
 
 # ---------- Helpers ----------
@@ -377,7 +378,7 @@ elif mode == "Weather (Open-Meteo)":
     # --- regular 1‑hour grid, but **avoid flat tail** -------------------
     series = (
         series
-        .resample("1H")  # pandas v3 prefers lowercase
+        .resample("1h")  # pandas v3 prefers lowercase
         .mean()
         # interpolate only *inside* the data, not beyond the first / last real point
         .interpolate("linear", limit_direction="both", limit_area="inside")
@@ -413,7 +414,7 @@ vals = series.values.astype(float)
 samples = max(0, len(vals) - lookback - HORIZON)
 per_sample = 0.0001 if kind == "Neural Network (MLP)" else 0.00003  # seconds
 est_time = samples * N * per_sample
-est_time = max(0.1, est_time)
+est_time = max(0.1, est_time)*3
 st.sidebar.info(f"Estimated run time: ~{est_time:,.1f} s")
 
 if len(vals) < lookback + HORIZON*2 + 10:
@@ -423,28 +424,30 @@ vals = series.values.astype(float)
 if len(vals) < lookback + HORIZON*2 + 10:
     st.error("Series too short."); st.stop()
 
-# ---------- FreqMoE run ----------
+# ---------- FreqMoE single-pass decomposition & training ----------
+comps_full, ener_full, bands = decompose(vals, N)
+w_b = w_f = ener_full / ener_full.sum()
 
-def run(data_arr: np.ndarray):
-    comps, ener, bands = decompose(data_arr, N)
-    #logits = (np.log(ener + 1e-8) - np.log(ener + 1e-8).max()) / TEMP
-    #w = np.exp(logits) + EPS; w /= w.sum()
-    w = ener / ener.sum()
+# ---------- Train experts sequentially with progress bar ----------
+progress = st.sidebar.progress(0)
+experts = []
+for i, comp in enumerate(comps_full, start=1):
+    ex = Expert(kind, lookback, HORIZON, i-1)
+    ex.fit(comp)
+    experts.append(ex)
+    progress.progress(int(i / N * 100))
 
-    def _train_predict(i_comp):
-        i, comp = i_comp
-        ex = Expert(kind, lookback, HORIZON, i)
-        ex.fit(comp)
-        return ex.pred(comp[-lookback:])
+# Back-test predictions: use windows ending just before the horizon
+back_preds = np.array([
+    ex.pred(comps_full[i][-HORIZON - lookback : -HORIZON])
+    for i, ex in enumerate(experts)
+])
 
-    n_jobs = min(N, max(1, mp.cpu_count() - 1))
-    preds = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(_train_predict)(ic) for ic in enumerate(comps)
-    )
-    return np.array(preds), w, bands, ener
-
-back_preds, w_b, bands, ener_b = run(vals[:-HORIZON])
-fore_preds, w_f, _, ener_f = run(vals)
+# Forecast predictions: use the most recent look-back window
+fore_preds = np.array([
+    ex.pred(comps_full[i][-lookback:])
+    for i, ex in enumerate(experts)
+])
 hist_anchor_bt = vals[-HORIZON-1]
 raw_backcast   = back_preds.sum(axis=0) 
 offset_bt      = hist_anchor_bt - raw_backcast[0]
@@ -521,7 +524,7 @@ expert_tbl = pd.DataFrame({
     "Freq start": starts,
     "Freq end": ends,
     "Bandwidth": widths,
-    "Band energy (bt)": ener_b.round(2),
+    #"Band energy (bt)": ener_b.round(2),
     "Weight % (bt)": (w_b*100).round(2),
     "Weight % (fut)": (w_f*100).round(2),
     "Model": kind,
@@ -547,3 +550,27 @@ for i in range(N):
                    f"back w={w_b[i]*100:.1f}%  future w={w_f[i]*100:.1f}%")
     ax_i.grid(alpha=0.3)
     st.pyplot(fig_i)
+
+
+
+# ---------- Prophet forecast comparison ----------
+st.subheader("🔮 Prophet Forecast Comparison")
+# Prepare data
+df_prophet = pd.DataFrame({
+    "ds": series.index,
+    "y": series.values.astype(float)
+})
+# Fit on history excluding the back-test window
+train_prophet = df_prophet.iloc[:-HORIZON]
+m_prophet = Prophet()
+m_prophet.fit(train_prophet)
+# Create future dataframe
+freq_str = pd.infer_freq(series.index) or "D"
+future = m_prophet.make_future_dataframe(periods=HORIZON, freq=freq_str)
+forecast_prophet = m_prophet.predict(future)
+# Plot Prophet forecast
+fig_p = m_prophet.plot(forecast_prophet)
+st.pyplot(fig_p)
+# Plot components (trend, weekly/yearly seasonality)
+fig_pc = m_prophet.plot_components(forecast_prophet)
+st.pyplot(fig_pc)

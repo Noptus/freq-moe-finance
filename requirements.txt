@@ -6,3 +6,6 @@ scikit-learn
 finnhub-python  # if using the official client
 matplotlib
 plotly
+prophet
+folium
+st_folium
