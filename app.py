@@ -42,7 +42,6 @@ st.sidebar.markdown("[Connect with me on LinkedIn](https://www.linkedin.com/in
 DEFAULT_POLY_KEY = "p46qnFerUpAecBAsNFBHzUhuhKGrYGM5"
 DEFAULT_POLY_KEY = ""
 POLY_EP = "https://api.polygon.io/v2/aggs/ticker/{tic}/range/1/day/{start}/{end}"
-HORIZON = 24*10
 TEMP, EPS = 1.0, 1e-3
 
 # ---------- Helpers ----------
@@ -352,8 +351,28 @@ if mode == "CSV Upload":
     col = st.sidebar.selectbox("Column", num)
     series = pd.Series(df[col]).dropna().astype(float).reset_index(drop=True)
 elif mode == "Weather (Open-Meteo)":
-    city = st.sidebar.text_input("Location (lat,lon)", "40.71,-74.01")   # NYC default
-    lat, lon = map(float, city.split(","))
+    import folium
+    from streamlit_folium import st_folium
+    with st.sidebar:
+        st.markdown("### 📍 Choose a predefined location")
+        locations = {
+            "New York, USA": (40.7128, -74.0060),
+            "London, UK": (51.5074, -0.1278),
+            "Paris, France": (48.8566, 2.3522),
+            "Tokyo, Japan": (35.6895, 139.6917),
+            "Sydney, Australia": (-33.8688, 151.2093),
+            "San Francisco, USA": (37.7749, -122.4194),
+            "Berlin, Germany": (52.5200, 13.4050),
+            "Beijing, China": (39.9042, 116.4074),
+            "Moscow, Russia": (55.7558, 37.6176),
+            "Rio de Janeiro, Brazil": (-22.9068, -43.1729),
+        }
+        location_name = st.selectbox("Location", list(locations.keys()), index=0)
+        lat, lon = locations[location_name]
+        st.markdown(f"Selected: **{location_name}** ({lat:.4f}, {lon:.4f})")
+        st.markdown("### Or click on the map below to override")
+        default_coords = list(locations.values())[0]
+        
     years = st.sidebar.slider("Years of history", 1, 5, 2)
     variable = st.sidebar.selectbox("Variable",
         ["temperature_2m", "relative_humidity_2m", "wind_speed_10m",
@@ -411,44 +430,66 @@ lookback = st.sidebar.slider("Look‑back (past timesteps)", 30, 2000, default_l
 
 # ---------- rough training‑time estimate ----------
 vals = series.values.astype(float)
-samples = max(0, len(vals) - lookback - HORIZON)
+samples = max(0, len(vals) - lookback - 30)
 per_sample = 0.0001 if kind == "Neural Network (MLP)" else 0.00003  # seconds
 est_time = samples * N * per_sample
 est_time = max(0.1, est_time)*3
 st.sidebar.info(f"Estimated run time: ~{est_time:,.1f} s")
 
-if len(vals) < lookback + HORIZON*2 + 10:
+if len(vals) < lookback + 30*2 + 10:
     st.error("Series too short."); st.stop()
 
 vals = series.values.astype(float)
-if len(vals) < lookback + HORIZON*2 + 10:
+if len(vals) < lookback + 30*2 + 10:
     st.error("Series too short."); st.stop()
 
-# ---------- FreqMoE single-pass decomposition & training ----------
-comps_full, ener_full, bands = decompose(vals, N)
-w_b = w_f = ener_full / ener_full.sum()
+# ---------- Separate horizons ----------
+HORIZON_BT = st.sidebar.slider(
+    "Back-test horizon (points)", 5, 200, 30, step=1
+)
+HORIZON_FC = st.sidebar.slider(
+    "Forecast horizon (points)", 5, 200, 30, step=1
+)
+
+#
+# ---------- FreqMoE decomposition without leakage ----------
+# Decompose only historical data for back-test gating and training
+vals_hist = vals[:-HORIZON_BT]
+comps_bt, ener_bt, bands = decompose(vals_hist, N)
+w_b = ener_bt / ener_bt.sum()
+
+# Decompose full data for forecast gating and forecasting
+comps_full, ener_full, _ = decompose(vals, N)
+w_f = ener_full / ener_full.sum()
 
 # ---------- Train experts sequentially with progress bar ----------
 progress = st.sidebar.progress(0)
 experts = []
-for i, comp in enumerate(comps_full, start=1):
-    ex = Expert(kind, lookback, HORIZON, i-1)
+for i, comp in enumerate(comps_bt, start=1):
+    ex = Expert(kind, lookback, HORIZON_BT, i-1)
     ex.fit(comp)
     experts.append(ex)
     progress.progress(int(i / N * 100))
 
-# Back-test predictions: use windows ending just before the horizon
+# ---------- Train forecast experts for HORIZON_FC ----------
+experts_fc = []
+for i, comp in enumerate(comps_full, start=1):
+    exf = Expert(kind, lookback, HORIZON_FC, i-1)
+    exf.fit(comp)
+    experts_fc.append(exf)
+
+# Back-test predictions: use windows ending just before the back-test horizon
 back_preds = np.array([
-    ex.pred(comps_full[i][-HORIZON - lookback : -HORIZON])
+    ex.pred(comps_bt[i][-HORIZON_BT - lookback : -HORIZON_BT])
     for i, ex in enumerate(experts)
 ])
 
-# Forecast predictions: use the most recent look-back window
+# Forecast predictions (HORIZON_FC): use forecast experts
 fore_preds = np.array([
-    ex.pred(comps_full[i][-lookback:])
-    for i, ex in enumerate(experts)
+    exf.pred(comps_full[i][-lookback:])
+    for i, exf in enumerate(experts_fc)
 ])
-hist_anchor_bt = vals[-HORIZON-1]
+hist_anchor_bt = vals[-HORIZON_BT-1]
 raw_backcast   = back_preds.sum(axis=0) 
 offset_bt      = hist_anchor_bt - raw_backcast[0]
 backcast       = raw_backcast + offset_bt
@@ -460,12 +501,12 @@ offset_fc      = hist_anchor_fc - raw_forecast[0]
 forecast       = raw_forecast + offset_fc
 
 # ---------- Plot main ----------
-zoom = max(lookback*2 + HORIZON, 240)
+zoom = max(lookback*2 + max(HORIZON_BT, HORIZON_FC), 240)
 start_idx = max(0, len(series) - zoom)
 fig, ax = plt.subplots(figsize=(12,6))
-ax.plot(series.index[start_idx:-HORIZON], vals[start_idx:-HORIZON], color="black", label="Historical")
-ax.plot(series.index[-HORIZON:], vals[-HORIZON:], color="black")
-ax.plot(series.index[-HORIZON:], backcast, color="orange", ls="--", label="Back-test pred")
+ax.plot(series.index[start_idx:-HORIZON_BT], vals[start_idx:-HORIZON_BT], color="black", label="Historical")
+ax.plot(series.index[-HORIZON_BT:], vals[-HORIZON_BT:], color="black")
+ax.plot(series.index[-HORIZON_BT:], backcast, color="orange", ls="--", label="Back-test pred")
 if isinstance(series.index, pd.DatetimeIndex):
     # Try to use the native frequency; if missing, infer from median diff
     if series.index.freq:
@@ -478,29 +519,29 @@ if isinstance(series.index, pd.DatetimeIndex):
         freq_off = pd.tseries.frequencies.to_offset(median_delta)
 
     fut_idx = pd.date_range(series.index[-1] + freq_off,
-                            periods=HORIZON,
+                            periods=HORIZON_FC,
                             freq=freq_off)
 else:
-    fut_idx = np.arange(len(series), len(series) + HORIZON)
-ax.plot(fut_idx, forecast, color="red", label="Forecast (+30)")
+    fut_idx = np.arange(len(series), len(series) + HORIZON_FC)
+ax.plot(fut_idx, forecast, color="red", label=f"Forecast (+{HORIZON_FC})")
 ax.set_title("FreqMoE – Energy-Quantile Bands")
 ax.legend(); ax.grid(alpha=0.3)
 st.pyplot(fig)
 
 # ---------- Metrics & details table ----------
-mae = np.mean(np.abs(backcast - vals[-HORIZON:]))
-rmse = np.sqrt(np.mean((backcast - vals[-HORIZON:])**2))
+mae = np.mean(np.abs(backcast - vals[-HORIZON_BT:]))
+rmse = np.sqrt(np.mean((backcast - vals[-HORIZON_BT:])**2))
 
 st.write(f"### Back-test MAE: {mae:.3f} | RMSE: {rmse:.3f}")
 # After computing backcast vs. actual
 
 # Ground‑truth segment for back‑test metrics
-actual_back = vals[-HORIZON:]
+actual_back = vals[-HORIZON_BT:]
 
 mape  = np.mean(np.abs((actual_back - backcast) / actual_back)) * 100
 mase  = mae / np.mean(np.abs(np.diff(actual_back, prepend=actual_back[0])))
 
-naive = np.concatenate(([vals[-HORIZON-1]], actual_back[:-1]))
+naive = np.concatenate(([vals[-HORIZON_BT-1]], actual_back[:-1]))
 rmse_naive = np.sqrt(np.mean((actual_back - naive)**2))
 theil_u = rmse / rmse_naive
 
@@ -508,8 +549,8 @@ da = (np.sign(np.diff(backcast)) == np.sign(np.diff(actual_back))).mean() * 100
 
 st.write(f"MAPE: {mape:.2f}% | MASE: {mase:.2f} | Theil U: {theil_u:.2f} | Directional Acc: {da:.1f}%")
 bench_df = benchmark_table(backcast=backcast,
-                           actual_back=vals[-HORIZON:],
-                           prev_history=vals[:-HORIZON],
+                           actual_back=vals[-HORIZON_BT:],
+                           prev_history=vals[:-HORIZON_BT],
                            season_len=5,          # 5 trading days = weekly season
                            ma_window=7)
 
@@ -529,6 +570,7 @@ expert_tbl = pd.DataFrame({
     "Weight % (fut)": (w_f*100).round(2),
     "Model": kind,
 }, index=[f"Expert {i+1}" for i in range(N)])
+
 st.subheader("Expert Summary Table")
 st.dataframe(expert_tbl.style.format({
     "Freq start": "{:d}",
@@ -539,12 +581,18 @@ st.dataframe(expert_tbl.style.format({
     "Weight % (fut)": "{:.2f}%",
     "Model": lambda x: x.replace("Neural Network (MLP)", "MLP").replace("Linear Regression", "LR")
 }))
+# ---------- Explanation of experts ----------
+st.markdown(f"The {N}-expert model decomposes your series into {N} distinct frequency bands.")
+st.markdown("• Expert 1 focuses on the slowest, long-term trends (low frequencies).")
+st.markdown("• Successive experts capture progressively higher-frequency components, revealing medium- and short-term fluctuations.")
+st.markdown("• The back-test and forecast weights table above shows each expert’s relative importance in reproducing history and projecting the future.")
+st.markdown("By blending these specialized forecasts, FreqMoE leverages both trend and noise patterns for more accurate long-horizon predictions.")
 
 # ---------- Expert plots ----------
 st.subheader("Expert Contributions")
 for i in range(N):
     fig_i, ax_i = plt.subplots(figsize=(12,3))
-    ax_i.plot(series.index[-HORIZON:], back_preds[i], ls="--", color="orange")
+    ax_i.plot(series.index[-HORIZON_BT:], back_preds[i], ls="--", color="orange")
     ax_i.plot(fut_idx, fore_preds[i], ls="--", color="blue")
     ax_i.set_title(f"Expert {i+1}  | band bins {bands[i].start}–{bands[i].stop} |\n"
                    f"back w={w_b[i]*100:.1f}%  future w={w_f[i]*100:.1f}%")
@@ -561,12 +609,12 @@ df_prophet = pd.DataFrame({
     "y": series.values.astype(float)
 })
 # Fit on history excluding the back-test window
-train_prophet = df_prophet.iloc[:-HORIZON]
+train_prophet = df_prophet.iloc[:-HORIZON_BT]
 m_prophet = Prophet()
 m_prophet.fit(train_prophet)
 # Create future dataframe
 freq_str = pd.infer_freq(series.index) or "D"
-future = m_prophet.make_future_dataframe(periods=HORIZON, freq=freq_str)
+future = m_prophet.make_future_dataframe(periods=HORIZON_FC, freq=freq_str)
 forecast_prophet = m_prophet.predict(future)
 # Plot Prophet forecast
 fig_p = m_prophet.plot(forecast_prophet)
