@@ -369,8 +369,7 @@ elif mode == "Weather (Open-Meteo)":
         }
         location_name = st.selectbox("Location", list(locations.keys()), index=0)
         lat, lon = locations[location_name]
-        st.markdown(f"Selected: **{location_name}** ({lat:.4f}, {lon:.4f})")
-        st.markdown("### Or click on the map below to override")
+        st.markdown(f"({lat:.4f}, {lon:.4f})")
         default_coords = list(locations.values())[0]
         
     years = st.sidebar.slider("Years of history", 1, 5, 2)
@@ -425,7 +424,7 @@ else:  # stocks or CSV
 
 st.sidebar.header("Model Params ⚙️")
 N = st.sidebar.slider("Experts", 2, 8, default_N)
-kind = st.sidebar.selectbox("Expert model", ["Neural Network (MLP)", "Linear Regression"], index=0)
+kind = st.sidebar.selectbox("Expert model", ["Linear Regression", "Neural Network (MLP)"], index=0)
 lookback = st.sidebar.slider("Look‑back (past timesteps)", 30, 2000, default_lookback, step=10)
 
 # ---------- rough training‑time estimate ----------
