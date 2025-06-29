@@ -27,6 +27,8 @@ from scipy.fft import rfft, irfft
 from sklearn.neural_network import MLPRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
+from joblib import Parallel, delayed
+import multiprocessing as mp
 
 # ---------- Config ----------
 st.set_page_config(page_title="FreqMoE Forecaster", page_icon="🔮", layout="wide")
@@ -64,8 +66,14 @@ def fetch_weather(latitude: float,
         "hourly": variable,
         "timezone": "UTC",
     }
-    r = requests.get(base, params=params, timeout=20)
-    r.raise_for_status()
+    for attempt in range(3):
+        try:
+            r = requests.get(base, params=params, timeout=10)
+            r.raise_for_status()
+            break
+        except requests.exceptions.ReadTimeout:
+            if attempt == 2:
+                raise
     js = r.json()
     if "hourly" not in js or variable not in js["hourly"]:
         raise ValueError("No data returned.")
@@ -161,11 +169,17 @@ class Expert:
         self.lk, self.h = lk, h
         self.sx, self.sy = StandardScaler(), StandardScaler()
         if kind == "Neural Network (MLP)":
-            hid1, hid2 = max(64, lk//2), max(32, lk//4)
-            self.m = MLPRegressor(hidden_layer_sizes=(hid1, hid2), activation="relu",
-                                   solver="adam", learning_rate="adaptive", alpha=1e-4,
-                                   early_stopping=True, validation_fraction=0.15,
-                                   n_iter_no_change=20, max_iter=1000, random_state=seed)
+            hid1, hid2 = max(32, lk//4), max(16, lk//8)
+            self.m = MLPRegressor(hidden_layer_sizes=(hid1, hid2),
+                                   activation="relu",
+                                   solver="adam",
+                                   learning_rate="adaptive",
+                                   alpha=1e-4,
+                                   early_stopping=True,
+                                   validation_fraction=0.1,
+                                   n_iter_no_change=10,
+                                   max_iter=400,
+                                   random_state=seed)
         else:
             self.m = LinearRegression()
 
@@ -339,16 +353,23 @@ if mode == "CSV Upload":
 elif mode == "Weather (Open-Meteo)":
     city = st.sidebar.text_input("Location (lat,lon)", "40.71,-74.01")   # NYC default
     lat, lon = map(float, city.split(","))
-    years = st.sidebar.slider("Years of history", 1, 40, 5)
+    years = st.sidebar.slider("Years of history", 1, 5, 2)
     variable = st.sidebar.selectbox("Variable",
         ["temperature_2m", "relative_humidity_2m", "wind_speed_10m",
          "surface_pressure", "precipitation"])
     end_d = dt.date.today()
     start_d = end_d - dt.timedelta(days=365*years)
-    series = fetch_weather(lat, lon,
-                           start_d.strftime("%Y-%m-%d"),
-                           end_d.strftime("%Y-%m-%d"),
-                           variable)
+    try:
+        series = fetch_weather(lat, lon,
+                               start_d.strftime("%Y-%m-%d"),
+                               end_d.strftime("%Y-%m-%d"),
+                               variable)
+    except requests.exceptions.ReadTimeout:
+        st.error("Open‑Meteo timed‑out. Please reduce the date range or try again later.")
+        st.stop()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
     # ---- make index uniform & naïve ----
     if series.index.tz is not None:
         series = series.tz_localize(None)
@@ -356,7 +377,7 @@ elif mode == "Weather (Open-Meteo)":
     # --- regular 1‑hour grid, but **avoid flat tail** -------------------
     series = (
         series
-        .resample("1H")
+        .resample("1h")  # pandas v3 prefers lowercase
         .mean()
         # interpolate only *inside* the data, not beyond the first / last real point
         .interpolate("linear", limit_direction="both", limit_area="inside")
@@ -390,7 +411,7 @@ lookback = st.sidebar.slider("Look‑back (past timesteps)", 30, 2000, default_l
 # ---------- rough training‑time estimate ----------
 vals = series.values.astype(float)
 samples = max(0, len(vals) - lookback - HORIZON)
-per_sample = 0.0002 if kind == "Neural Network (MLP)" else 0.00005  # seconds
+per_sample = 0.0001 if kind == "Neural Network (MLP)" else 0.00003  # seconds
 est_time = samples * N * per_sample
 est_time = max(0.1, est_time)
 st.sidebar.info(f"Estimated run time: ~{est_time:,.1f} s")
@@ -409,10 +430,17 @@ def run(data_arr: np.ndarray):
     #logits = (np.log(ener + 1e-8) - np.log(ener + 1e-8).max()) / TEMP
     #w = np.exp(logits) + EPS; w /= w.sum()
     w = ener / ener.sum()
-    preds = []
-    for i, comp in enumerate(comps):
-        ex = Expert(kind, lookback, HORIZON, i);
-        ex.fit(comp); preds.append(ex.pred(comp[-lookback:]))
+
+    def _train_predict(i_comp):
+        i, comp = i_comp
+        ex = Expert(kind, lookback, HORIZON, i)
+        ex.fit(comp)
+        return ex.pred(comp[-lookback:])
+
+    n_jobs = min(N, max(1, mp.cpu_count() - 1))
+    preds = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(_train_predict)(ic) for ic in enumerate(comps)
+    )
     return np.array(preds), w, bands, ener
 
 back_preds, w_b, bands, ener_b = run(vals[:-HORIZON])
