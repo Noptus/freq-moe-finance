@@ -6,6 +6,6 @@ scikit-learn
 finnhub-python  # if using the official client
 matplotlib
 plotly
-prophet
+Prophet
 folium
 streamlit-folium
