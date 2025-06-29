@@ -8,4 +8,4 @@ matplotlib
 plotly
 prophet
 folium
-st_folium
+streamlit-folium
