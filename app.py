@@ -377,7 +377,7 @@ elif mode == "Weather (Open-Meteo)":
     # --- regular 1‑hour grid, but **avoid flat tail** -------------------
     series = (
         series
-        .resample("H")  # pandas v3 prefers lowercase
+        .resample("1H")  # pandas v3 prefers lowercase
         .mean()
         # interpolate only *inside* the data, not beyond the first / last real point
         .interpolate("linear", limit_direction="both", limit_area="inside")
